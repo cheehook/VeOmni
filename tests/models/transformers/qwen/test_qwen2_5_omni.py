@@ -41,7 +41,6 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
-    ops_config_scope,
     qwen_image_inputs,
 )
 from tests.models.tiny_configs import tiny_qwen2_5_omni_thinker_config as _tiny_thinker_config
@@ -51,12 +50,12 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _build_ours(config: Qwen2_5OmniThinkerConfig, ops: SimpleNamespace | None = None):
-    from veomni.models.transformers.qwen2_5_omni.generated.patched_modeling_qwen2_5_omni_gpu import (
+    from veomni.models.transformers.qwen2_5_omni.modeling_qwen2_5_omni import (
         Qwen2_5OmniThinkerForConditionalGeneration,
     )
 
-    with ops_config_scope(ops if ops is not None else eager_ops_config()):
-        return Qwen2_5OmniThinkerForConditionalGeneration(config)
+    config._set_ops_implementation(ops if ops is not None else eager_ops_config())
+    return Qwen2_5OmniThinkerForConditionalGeneration(config)
 
 
 def _mask_kwargs(input_ids: torch.Tensor) -> dict:
@@ -142,7 +141,7 @@ def test_qwen2_5_omni_vision_and_audio_attention_veomni_sdpa_matches_hf(availabl
         Qwen2_5OmniVisionAttention as HFQwen2_5OmniVisionAttention,
     )
 
-    from veomni.models.transformers.qwen2_5_omni.generated.patched_modeling_qwen2_5_omni_gpu import (
+    from veomni.models.transformers.qwen2_5_omni.modeling_qwen2_5_omni import (
         Qwen2_5OmniAudioAttention,
         Qwen2_5OmniVisionAttention,
     )
@@ -156,9 +155,10 @@ def test_qwen2_5_omni_vision_and_audio_attention_veomni_sdpa_matches_hf(availabl
     hf_vision_attn = HFQwen2_5OmniVisionAttention(vision_cfg_hf).eval()
 
     vision_cfg_ours = _tiny_thinker_config().vision_config
-    vision_cfg_ours._attn_implementation = "veomni_sdpa"
-    with ops_config_scope(eager_ops_config()):
-        ours_vision_attn = Qwen2_5OmniVisionAttention(vision_cfg_ours).eval()
+    ops = eager_ops_config()
+    ops.attn_implementation = "veomni_sdpa"
+    vision_cfg_ours._set_ops_implementation(ops)
+    ours_vision_attn = Qwen2_5OmniVisionAttention(vision_cfg_ours).eval()
     ours_vision_attn.load_state_dict(hf_vision_attn.state_dict())
 
     vision_hidden = torch.randn(7, vision_cfg_hf.hidden_size)
@@ -176,9 +176,8 @@ def test_qwen2_5_omni_vision_and_audio_attention_veomni_sdpa_matches_hf(availabl
     hf_audio_attn = HFQwen2_5OmniAudioAttention(audio_cfg_hf).eval()
 
     audio_cfg_ours = _tiny_thinker_config().audio_config
-    audio_cfg_ours._attn_implementation = "veomni_sdpa"
-    with ops_config_scope(eager_ops_config()):
-        ours_audio_attn = Qwen2_5OmniAudioAttention(audio_cfg_ours).eval()
+    audio_cfg_ours._set_ops_implementation(ops)
+    ours_audio_attn = Qwen2_5OmniAudioAttention(audio_cfg_ours).eval()
     ours_audio_attn.load_state_dict(hf_audio_attn.state_dict())
 
     audio_hidden = torch.randn(7, audio_cfg_hf.d_model)
@@ -202,9 +201,10 @@ def test_qwen2_5_omni_vision_and_audio_attention_veomni_sdpa_matches_hf(availabl
 
     monkeypatch.setattr(sage_backend, "sageattn", fake_sage)
     cfg = _tiny_thinker_config().audio_config
-    cfg._attn_implementation = "veomni_sage_attention"
-    with ops_config_scope(eager_ops_config()):
-        attn = Qwen2_5OmniAudioAttention(cfg).eval()
+    sage_ops = eager_ops_config()
+    sage_ops.attn_implementation = "veomni_sage_attention"
+    cfg._set_ops_implementation(sage_ops)
+    attn = Qwen2_5OmniAudioAttention(cfg).eval()
     attn.load_state_dict(hf_audio_attn.state_dict())
     h1 = torch.randn(4, cfg.d_model)
     h2 = h1.clone()

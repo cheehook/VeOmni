@@ -8,6 +8,34 @@ from scripts.ci.accelerator.launch_plan import CasePlan, LaunchSpec
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
+@pytest.mark.parametrize("backend", ["cpu", "cuda", "npu", "mlu"])
+@pytest.mark.parametrize("cpu_plan", [False, True])
+def test_model_attention_guard_respects_supported_host_and_plan(monkeypatch, backend, cpu_plan):
+    """The CI guard protects CPU plans and leaves local MLU tests outside its resolver."""
+    from types import SimpleNamespace
+
+    import transformers.modeling_utils
+
+    from tests.tools import model_fixtures
+    from veomni.ops import install
+
+    def resolve(_node):
+        assert backend != "mlu", "Local MLU tests must not enter the CUDA/NPU CI planner"
+        return CasePlan.sequential(LaunchSpec(device="cpu" if cpu_plan else "accelerator"))
+
+    monkeypatch.setattr(model_fixtures, "get_device_type", lambda: backend)
+    monkeypatch.setattr(model_fixtures, "resolve_plan", resolve)
+    previous = transformers.modeling_utils.lazy_import_flash_attention, install._load_veomni_local_flash_kernel
+    model_fixtures.cpu_model_attention_kernel_guard.__wrapped__(monkeypatch, SimpleNamespace(node=object()))
+    current = transformers.modeling_utils.lazy_import_flash_attention, install._load_veomni_local_flash_kernel
+    if backend != "mlu" and (backend == "cpu" or cpu_plan):
+        for loader in current:
+            with pytest.raises(AssertionError, match="CPU model construction"):
+                loader()
+    else:
+        assert current == previous
+
+
 def test_device_pool_reservations_and_full_node_exclusion():
     import threading
 
@@ -216,6 +244,59 @@ def test_npu_adapter_preserves_owned_host_slice_and_resets_ranks():
     slices = list(run_jobs(jobs, list(caps.devices), execute).values())
     assert set.union(*slices) == set(caps.devices)
     assert sum(map(len, slices)) == len(set.union(*slices))  # No device is leased twice.
+
+
+def test_xpu_adapter_masks_worker_and_cpu_visibility_and_probes_owned_slice(monkeypatch, tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    from scripts.ci.accelerator.launch_plan import XPU_HIDDEN_MASK, RunnerCapabilities
+    from scripts.ci.accelerator.runtime.devices import child_environment, probe
+    from veomni.utils import device
+
+    caps = RunnerCapabilities("xpu", ("2", "5"))
+    worker = child_environment(caps, ["5"], environ={"ZE_AFFINITY_MASK": "0,1"})
+    assert worker["ZE_AFFINITY_MASK"] == "5"
+    cpu = child_environment(caps, [], cpu=True, environ={"ZE_AFFINITY_MASK": "2,5"})
+    assert cpu["ZE_AFFINITY_MASK"] == XPU_HIDDEN_MASK
+
+    monkeypatch.setenv("ZE_AFFINITY_MASK", "2,5")
+    monkeypatch.setattr(device, "get_device_type", lambda: "xpu")
+    monkeypatch.setattr(
+        device,
+        "get_torch_device",
+        lambda: SimpleNamespace(is_available=lambda: True, device_count=lambda: 2),
+    )
+    output = tmp_path / "capabilities.json"
+    probe(str(output))
+    assert json.loads(output.read_text()) == {"backend": "xpu", "devices": ["2", "5"]}
+
+    monkeypatch.setenv("ZE_AFFINITY_MASK", "")  # Level Zero treats an empty mask as unset.
+    probe(str(output))
+    assert json.loads(output.read_text()) == {"backend": "xpu", "devices": ["0", "1"]}
+
+
+def test_xpu_launch_validation_uses_affinity_mask(monkeypatch, tmp_path):
+    import json
+
+    from scripts.ci.accelerator.launch_plan import XPU_HIDDEN_MASK, CasePlan, LaunchSpec, ResourcePlanError
+    from scripts.ci.accelerator.pytest_plugin import validate_launch
+
+    capabilities = tmp_path / "capabilities.json"
+    capabilities.write_text(json.dumps({"backend": "xpu", "devices": ["2", "5"]}))
+    monkeypatch.setenv("VEOMNI_CI_CAPABILITIES", str(capabilities))
+    monkeypatch.setenv("VEOMNI_CI_ACTIVE_PLAN", json.dumps(CasePlan.sequential(LaunchSpec(nproc=2)).to_dict()))
+    monkeypatch.setenv("VEOMNI_CI_LEASE", json.dumps(["2", "5"]))
+
+    validate_launch(2, env={"ZE_AFFINITY_MASK": "2,5"})
+    with pytest.raises(ResourcePlanError, match="cannot run on lease"):
+        validate_launch(2, env={"ZE_AFFINITY_MASK": "0,1"})
+
+    monkeypatch.setenv("VEOMNI_CI_ACTIVE_PLAN", json.dumps(CasePlan.sequential(LaunchSpec(device="cpu")).to_dict()))
+    validate_launch(1, env={"ZE_AFFINITY_MASK": XPU_HIDDEN_MASK})
+    for env in ({"ZE_AFFINITY_MASK": ""}, {}):
+        with pytest.raises(ResourcePlanError, match="hidden mask"):
+            validate_launch(1, env=env)
 
 
 def test_case_batches_preserve_inventory_and_resource_requests():

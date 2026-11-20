@@ -268,7 +268,7 @@ def test_forward_missing_cu_seq_lens_q_raises_value_error():
     """Shared-prefix training without cu_seq_lens_q must raise a clear ValueError."""
     from unittest.mock import MagicMock
 
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+    from veomni.models.transformers.qwen3_5.modeling_qwen3_5 import (
         Qwen3_5ForConditionalGeneration,
     )
 
@@ -276,6 +276,7 @@ def test_forward_missing_cu_seq_lens_q_raises_value_error():
     mock_self.mtp = None
     mock_self.config.text_config.shared_prefix_training = True
     mock_self.config.text_config._attn_implementation = "flash_attention_2"
+    mock_self.config.text_config.ops_config.attn_implementation = "flash_attention_2"
     input_ids = torch.tensor([[1, 2, 3]])
 
     with pytest.raises(ValueError, match="Shared-prefix training requires packed-sequence metadata"):
@@ -289,7 +290,7 @@ def test_forward_incompatible_attn_impl_raises_not_implemented():
     """Shared-prefix training with non-flash attention backend must raise NotImplementedError."""
     from unittest.mock import MagicMock
 
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+    from veomni.models.transformers.qwen3_5.modeling_qwen3_5 import (
         Qwen3_5ForConditionalGeneration,
     )
 
@@ -297,6 +298,7 @@ def test_forward_incompatible_attn_impl_raises_not_implemented():
     mock_self.mtp = None
     mock_self.config.text_config.shared_prefix_training = True
     mock_self.config.text_config._attn_implementation = "eager"
+    mock_self.config.text_config.ops_config.attn_implementation = "eager"
     input_ids = torch.tensor([[1, 2, 3]])
 
     with pytest.raises(NotImplementedError, match="Shared-prefix training needs a varlen attention backend"):
@@ -310,17 +312,18 @@ def test_forward_sp_enabled_raises_not_implemented(monkeypatch):
     """Shared-prefix training with sequence parallelism enabled must raise NotImplementedError."""
     from unittest.mock import MagicMock
 
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+    from veomni.models.transformers.qwen3_5.modeling_qwen3_5 import (
         Qwen3_5ForConditionalGeneration,
     )
 
     monkeypatch.setattr(
-        "veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu.get_parallel_state",
+        "veomni.models.transformers.qwen3_5.modeling_qwen3_5.get_parallel_state",
         lambda: MagicMock(sp_enabled=True),
     )
     mock_self = MagicMock()
     mock_self.config.text_config.shared_prefix_training = True
     mock_self.config.text_config._attn_implementation = "flash_attention_2"
+    mock_self.config.text_config.ops_config.attn_implementation = "flash_attention_2"
     input_ids = torch.tensor([[1, 2, 3]])
 
     with pytest.raises(NotImplementedError, match="Shared-prefix training does not support sequence parallelism yet."):
@@ -335,12 +338,12 @@ def test_text_model_past_key_values_raises_not_implemented(monkeypatch):
     """Shared-prefix training in TextModel must raise NotImplementedError if past_key_values is passed."""
     from unittest.mock import MagicMock
 
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+    from veomni.models.transformers.qwen3_5.modeling_qwen3_5 import (
         Qwen3_5TextModel,
     )
 
     monkeypatch.setattr(
-        "veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu.get_parallel_state",
+        "veomni.models.transformers.qwen3_5.modeling_qwen3_5.get_parallel_state",
         lambda: MagicMock(sp_enabled=False),
     )
     mock_self = MagicMock()
@@ -364,7 +367,7 @@ def test_npu_gated_delta_rule_eager_raises_runtime_error():
     """NPU GatedDeltaNet with eager implementation must raise RuntimeError under shared-prefix training."""
     from unittest.mock import MagicMock
 
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_npu import (
+    from veomni.models.transformers.qwen3_5.modeling_qwen3_5 import (
         Qwen3_5GatedDeltaNet,
     )
 

@@ -339,7 +339,7 @@ def _dispatch_buffer(
         module._buffers[name].copy_(buffer.to(device=orig_tensor.device, dtype=orig_tensor.dtype))
 
 
-def _get_communication_device(init_device: Literal["cpu", "cuda", "npu", "mlu"]) -> torch.device:
+def _get_communication_device(init_device: Literal["cpu", "cuda", "npu", "mlu", "xpu"]) -> torch.device:
     if init_device == "cpu":
         return torch.device(get_device_type())
     return torch.device(init_device)
@@ -410,7 +410,7 @@ def _param_larger_than(shape: Tuple[int, ...], dtype: torch.dtype, max_load_broa
 def load_model_weights(
     model: Union["nn.Module", "PreTrainedModel"],
     weights_path: str,
-    init_device: Literal["cpu", "cuda", "npu", "mlu"] = "cuda",
+    init_device: Literal["cpu", "cuda", "npu", "mlu", "xpu"] = "cuda",
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
     **kwargs,
 ) -> None:
@@ -660,7 +660,7 @@ def _read_persistent_extra_parallel_slice(
 def load_model_weights_ep_sharded(
     model: Union["nn.Module", "PreTrainedModel"],
     weights_path: str,
-    init_device: Literal["cpu", "cuda", "npu"] = "cuda",
+    init_device: Literal["cpu", "cuda", "npu", "mlu", "xpu"] = "cuda",
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
     **kwargs,
 ) -> None:
@@ -1208,7 +1208,7 @@ def _stream_lora_adapter_ep_sharded(
 def rank0_load_and_broadcast_weights(
     model: Union["nn.Module", "PreTrainedModel"],
     weights_path: str,
-    init_device: Literal["cpu", "cuda", "npu", "mlu"] = "cuda",
+    init_device: Literal["cpu", "cuda", "npu", "mlu", "xpu"] = "cuda",
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
     cpu_load_param_name: List[str] = None,
     max_load_broadcast_size: float = 20.0,  # in GB
@@ -1650,6 +1650,52 @@ def rank0_load_and_broadcast_weights(
         prepare_fqn_to_index_mapping_for_model(model, fqn_to_index_mapping)
 
 
+def tie_word_embeddings_if_requested(model: Union["nn.Module", "PreTrainedModel"]) -> bool:
+    """Re-attach the output head to the input embedding when the config asks for it.
+
+    ``to_empty()`` (and building on meta) leaves a tied pair as two independent
+    storages, so the embedding and head have to be re-pointed at one tensor. This
+    is the single implementation both load paths use — ``post_process_after_weight_loading``
+    (meta / FSDP) and ``CustomizedModelingLoader.load_model`` (eager) — because a
+    divergence between them is how one path ties and the other crashes.
+
+    A model with no output head is skipped, not treated as an error. That is the
+    normal shape of a SeedOmni backbone (``Qwen3Llm``, ``Qwen3MoeLlm``): it owns
+    only the decoder, and the vocabulary half — where the one real tie lives —
+    is a separate module. Their ``get_output_embeddings()`` returns ``None``, and
+    assigning to ``None._parameters`` used to raise.
+
+    A tied ``TextEncoder`` still takes this path: it reports ``embed_tokens`` as
+    its output head when ``tie_word_embeddings`` is set (see
+    ``TextEncoder.get_output_embeddings``), so the assignment is a harmless
+    self-assignment that keeps the pair pointing at one tensor.
+
+    Returns whether an assignment was made.
+    """
+    # Nested multimodal layouts can disable tying on either side (InternVL on
+    # inner, Qwen3VLMoe on outer with inner silent), so AND both. Treat unset as
+    # True so a silent side does not override an explicit True, but require at
+    # least one side to set the flag -- if neither does, default to False
+    # (matches HF v5).
+    text_config = (
+        model.config.get_text_config(decoder=True) if hasattr(model.config, "get_text_config") else model.config
+    )
+    if not (hasattr(model.config, "tie_word_embeddings") or hasattr(text_config, "tie_word_embeddings")):
+        return False
+    if not getattr(model.config, "tie_word_embeddings", True):
+        return False
+    if not getattr(text_config, "tie_word_embeddings", True):
+        return False
+
+    output_embeddings = model.get_output_embeddings()
+    if output_embeddings is None:
+        # No vocabulary head on this module: nothing to tie.
+        return False
+    input_embeddings = model.get_input_embeddings()
+    output_embeddings._parameters["weight"] = input_embeddings._parameters["weight"]
+    return True
+
+
 def post_process_after_weight_loading(
     model: Union["nn.Module", "PreTrainedModel"],
     buffer_dict,
@@ -1669,27 +1715,11 @@ def post_process_after_weight_loading(
         for name in sorted(parameter_names_left):
             _init_parameter(model, name, parameter_names_left=parameter_names_left)
 
-    # to_empty() leaves embeddings untied (except under FSDP2 swap-tensor);
-    # re-tie only when the config asks for it. Nested multimodal layouts can
-    # disable tying on either side (InternVL on inner, Qwen3VLMoe on outer with
-    # inner silent), so AND both. Treat unset as True so a silent side does not
-    # override an explicit True, but require at least one side to set the flag
-    # -- if neither does, default to False (matches HF v5).
-    text_config = (
-        model.config.get_text_config(decoder=True) if hasattr(model.config, "get_text_config") else model.config
-    )
-    if (
-        (hasattr(model.config, "tie_word_embeddings") or hasattr(text_config, "tie_word_embeddings"))
-        and getattr(model.config, "tie_word_embeddings", True)
-        and getattr(text_config, "tie_word_embeddings", True)
-    ):
-        try:
-            input_embeddings = model.get_input_embeddings()
-            output_embeddings = model.get_output_embeddings()
-            output_embeddings._parameters["weight"] = input_embeddings._parameters["weight"]
-        except Exception as e:
-            logger.info_rank0(f"Failed to tie embeddings: {e}")
-            raise RuntimeError("Failed to tie input/output embeddings") from e
+    try:
+        tie_word_embeddings_if_requested(model)
+    except Exception as e:
+        logger.info_rank0(f"Failed to tie embeddings: {e}")
+        raise RuntimeError("Failed to tie input/output embeddings") from e
 
 
 def _normalize_save_dtype(save_dtype: Optional[Union[str, "torch.dtype"]]) -> Optional["torch.dtype"]:

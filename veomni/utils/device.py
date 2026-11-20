@@ -31,21 +31,30 @@ IS_CUDA_AVAILABLE = torch.cuda.is_available()
 # not registered, so treat that as NPU-unavailable rather than crashing on import.
 IS_NPU_AVAILABLE = is_torch_npu_available() and hasattr(torch, "npu")
 IS_MLU_AVAILABLE = is_torch_mlu_available()
+# Intel GPU support ships in stock PyTorch, so no package check is needed.
+IS_XPU_AVAILABLE = hasattr(torch, "xpu") and torch.xpu.is_available()
 
 if IS_NPU_AVAILABLE:
     torch.npu.config.allow_internal_format = False
 
 MOE_TRITON_DEVICE_TYPES = ("cuda", "mlu")
+# Backends whose torch build registers a ``torch._fused_adamw_`` kernel.
+FUSED_ADAMW_DEVICE_TYPES = ("cuda", "npu")
+# Backends the swap optimizer's async copy streams are validated on; other
+# accelerators (e.g. MLU) copy synchronously.
+STREAM_DEVICE_TYPES = ("cuda", "npu")
 
 
 def get_device_type() -> str:
-    """Get device type based on current machine, currently only support CPU, CUDA, NPU, MLU."""
+    """Get device type based on current machine, currently only support CPU, CUDA, NPU, MLU, XPU."""
     if IS_CUDA_AVAILABLE:
         device = "cuda"
     elif IS_NPU_AVAILABLE:
         device = "npu"
     elif IS_MLU_AVAILABLE:
         device = "mlu"
+    elif IS_XPU_AVAILABLE:
+        device = "xpu"
     else:
         device = "cpu"
 
@@ -92,6 +101,8 @@ def get_dist_comm_backend() -> str:
         return "hccl"
     elif IS_MLU_AVAILABLE:
         return "cncl"
+    elif IS_XPU_AVAILABLE:
+        return "xccl"
     else:
         raise RuntimeError(f"No available distributed communication backend found on device type {get_device_type()}.")
 
@@ -109,6 +120,8 @@ def stream_synchronize() -> None:
         torch.npu.current_stream().synchronize()
     elif IS_MLU_AVAILABLE:
         torch.mlu.current_stream().synchronize()
+    elif IS_XPU_AVAILABLE:
+        torch.xpu.current_stream().synchronize()
     else:
         synchronize()
 
@@ -240,8 +253,9 @@ def get_compute_units():
 
     # Use match/case for device-specific logic (Python 3.10+)
     match device_type:
-        case "cuda":
-            device_properties = torch.cuda.get_device_properties(0)
+        case "cuda" | "npu":
+            # An NPU publishes the same counter as CUDA: one entry per AI core.
+            device_properties = getattr(torch, device_type).get_device_properties(0)
             NUM_SMS = device_properties.multi_processor_count
         case "xpu":
             device_properties = torch.xpu.get_device_properties(0)
@@ -250,7 +264,7 @@ def get_compute_units():
             device_properties = torch.mlu.get_device_properties(0)
             NUM_SMS = device_properties.multi_processor_count
         case _:
-            print("No CUDA, XPU, or MLU device available. Using CPU.")
+            print("No CUDA, NPU, XPU, or MLU device available. Using CPU.")
             # For CPU, you might want to use the number of CPU cores
             NUM_SMS = torch.get_num_threads()
 

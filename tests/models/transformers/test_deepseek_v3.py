@@ -29,28 +29,19 @@ from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCa
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
-    ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_deepseek_v3_config as _tiny_config
 
 
 def _dsv3_cls():
-    from veomni.utils.device import IS_NPU_AVAILABLE
+    from veomni.models.transformers.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
 
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.deepseek_v3.generated.patched_modeling_deepseek_v3_npu import (
-            DeepseekV3ForCausalLM,
-        )
-    else:
-        from veomni.models.transformers.deepseek_v3.generated.patched_modeling_deepseek_v3_gpu import (
-            DeepseekV3ForCausalLM,
-        )
     return DeepseekV3ForCausalLM
 
 
 def _build_ours(config: DeepseekV3Config, ops: SimpleNamespace | None = None):
-    with ops_config_scope(ops if ops is not None else eager_ops_config()):
-        return _dsv3_cls()(config)
+    config._set_ops_implementation(ops if ops is not None else eager_ops_config())
+    return _dsv3_cls()(config)
 
 
 def test_deepseek_v3_eager_matches_hf():

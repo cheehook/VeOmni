@@ -4,16 +4,14 @@
 
 This document provides in-depth implementation details for each patch applied in the **Qwen3-Omni-MoE** integration — VeOmni's most complex model type, covering image, video, and audio modalities with MoE and Expert Parallelism. Use this alongside [guide_and_checklist.md](./guide_and_checklist.md).
 
-> **Scope note:** VeOmni now ships patchgen-generated modeling files under
-> `veomni/models/transformers/<model>/generated/`. The actual patches live in
-> [veomni/models/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/models/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py)
+> **Scope note:** VeOmni ships standalone modeling files under
+> `veomni/models/transformers/<model>/modeling_<model>.py`. The actual implementation lives in
+> [veomni/models/transformers/qwen3_omni_moe/modeling_qwen3_omni_moe.py](../../../veomni/models/transformers/qwen3_omni_moe/modeling_qwen3_omni_moe.py)
 > rather than the runtime `apply_veomni_*_patch()` helpers shown below. The
 > patterns (config fix, FSDP dummy, SP, MoE `VeomniOp`, EP plan, processor patch)
-> are unchanged; what has changed is *where* the patches are declared
-> (declarative patchgen config emitted into `generated/`) rather than applied
-> at import time. See
-> [the patchgen design guide](../../design/patchgen.md) and
-> the `veomni-patchgen-model` agent skill for the current flow.
+> are unchanged; what has changed is *where* the adaptations live (directly in
+> `modeling_qwen3_omni_moe.py`) rather than applied at import time. See the
+> `/veomni-new-model` agent skill for the current workflow.
 
 ---
 
@@ -22,13 +20,17 @@ This document provides in-depth implementation details for each patch applied in
 Many models set `tie_word_embeddings=True` by default but don't implement `get_output_embeddings()`. VeOmni's `CustomizedModelingLoader` tries to tie embeddings after weight loading and will crash. Fix in `configuration_*.py`:
 
 ```python
-class YourModelConfig(_HFYourModelConfig):
+from veomni.models import VeOmniPretrainedConfig
+from veomni.models.registry import MODEL_CONFIG_REGISTRY
+
+class YourModelConfig(VeOmniPretrainedConfig, _HFYourModelConfig):
     def __init__(self, **kwargs):
         kwargs.pop("tie_word_embeddings", None)
         super().__init__(tie_word_embeddings=False, **kwargs)
 
-def apply_veomni_patch():
-    hf_config_module.YourModelConfig = YourModelConfig
+@MODEL_CONFIG_REGISTRY.register("your_model")
+def register_your_model_config():
+    return YourModelConfig
 ```
 
 ---
@@ -204,7 +206,6 @@ if sp_enabled and pixel_values is not None:
 The standard HuggingFace MoE uses `nn.ModuleList` of individual expert MLPs. VeOmni replaces this with a single module holding stacked 3D weight tensors and an instance-local `moe_experts` handle. `eager` is a registered row, not a separate `ModuleList` fork. EP sharding also requires the stacked layout.
 
 ```python
-from veomni.ops.config import resolve_op_impl
 from veomni.ops import VeomniOp
 
 
@@ -221,7 +222,7 @@ class YourModelExperts(nn.Module):
         self.down_proj = nn.Parameter(
             torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
         )
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
+        self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
         unused = self.gate_up_proj.new_empty(0)
@@ -237,7 +238,7 @@ class YourModelExperts(nn.Module):
         )
 ```
 
-Use `@config.replace_class("<M>Experts")` so the upstream `@use_experts_implementation` decorator is dropped. Pass the merged `gate_up_proj` as `fc1_1_2_weight`; leave the split `fc1_*` slots empty. Do not branch on `_moe_implementation in {"eager", "fused"}` or call a public `fused_moe_forward`.
+Define the `<M>Experts` class directly in the standalone modeling file and remove the upstream `@use_experts_implementation` decorator. Pass the merged `gate_up_proj` as `fc1_1_2_weight`; leave the split `fc1_*` slots empty. Do not branch on `_moe_implementation in {"eager", "fused"}` or call a public `fused_moe_forward`.
 
 Also patch `_init_weights` for the stacked parameters:
 
@@ -306,11 +307,10 @@ instance-local registry handle to get fused selection and correct SP loss reduct
 from functools import partial
 
 from veomni.models.loss_utils import ForCausalLMLoss
-from veomni.ops.config import resolve_op_impl
 from veomni.ops import VeomniOp
 
 # In the model constructor:
-impl = resolve_op_impl("cross_entropy_loss_implementation")
+impl = config.ops_config.cross_entropy_loss_implementation
 self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
 self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
 

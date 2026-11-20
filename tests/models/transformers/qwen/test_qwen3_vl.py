@@ -34,10 +34,8 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
-    ops_config_scope,
     qwen_image_inputs,
     qwen_video_inputs,
-    stamp_attn_implementation,
 )
 from tests.models.tiny_configs import tiny_qwen3_vl_config as _tiny_config
 
@@ -47,24 +45,14 @@ VIDEO_TOKEN_ID = 121
 
 
 def _qwen3_vl_cls():
-    from veomni.utils.device import IS_NPU_AVAILABLE
+    from veomni.models.transformers.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
 
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_npu import (
-            Qwen3VLForConditionalGeneration,
-        )
-    else:
-        from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
-            Qwen3VLForConditionalGeneration,
-        )
     return Qwen3VLForConditionalGeneration
 
 
 def _build_ours(config: Qwen3VLConfig, ops: SimpleNamespace | None = None):
-    ops = ops if ops is not None else eager_ops_config()
-    stamp_attn_implementation(config, ops.attn_implementation)
-    with ops_config_scope(ops):
-        return _qwen3_vl_cls()(config)
+    config._set_ops_implementation(ops if ops is not None else eager_ops_config())
+    return _qwen3_vl_cls()(config)
 
 
 def test_qwen3_vl_eager_matches_hf_text_only():
@@ -102,35 +90,22 @@ def test_qwen3_vl_async_text_skips_ulysses_but_vision_stays_sync():
     """Text async gathers outside attention; vision must keep sync Ulysses."""
     import inspect
 
-    from veomni.models.transformers.qwen3_vl.generated import (
-        patched_modeling_qwen3_vl_gpu,
-        patched_modeling_qwen3_vl_npu,
-    )
-    from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
-        _qwen3_vl_async_ulysses_attention_forward,
-        qwen3_vl_vision_attention_forward_patched,
-    )
-    from veomni.models.transformers.qwen3_vl_moe.generated import (
-        patched_modeling_qwen3_vl_moe_gpu,
-        patched_modeling_qwen3_vl_moe_npu,
-    )
+    from veomni.models.transformers.qwen3_vl import modeling_qwen3_vl
+    from veomni.models.transformers.qwen3_vl_moe import modeling_qwen3_vl_moe
 
-    assert "skip_ulysses=True" in inspect.getsource(_qwen3_vl_async_ulysses_attention_forward)
-    assert "rms_norm=self.q_norm.veomni_rms_norm" in inspect.getsource(_qwen3_vl_async_ulysses_attention_forward)
-    assert "skip_ulysses=True" not in inspect.getsource(qwen3_vl_vision_attention_forward_patched)
-    for module in (
-        patched_modeling_qwen3_vl_gpu,
-        patched_modeling_qwen3_vl_npu,
-        patched_modeling_qwen3_vl_moe_gpu,
-        patched_modeling_qwen3_vl_moe_npu,
-    ):
+    assert "skip_ulysses=True" in inspect.getsource(modeling_qwen3_vl._qwen3_vl_async_ulysses_attention_forward)
+    assert "rms_norm=self.q_norm.veomni_rms_norm" in inspect.getsource(
+        modeling_qwen3_vl._qwen3_vl_async_ulysses_attention_forward
+    )
+    assert "skip_ulysses=True" not in inspect.getsource(modeling_qwen3_vl.Qwen3VLVisionAttention.forward)
+    for module in (modeling_qwen3_vl, modeling_qwen3_vl_moe):
         source = inspect.getsource(module._qwen3_vl_async_ulysses_attention_forward)
         assert "skip_ulysses=True" in source
         assert "rms_norm=self.q_norm.veomni_rms_norm" in source
 
 
 def test_qwen3_vl_async_helper_forwards_skip_ulysses(monkeypatch):
-    from veomni.models.transformers.qwen3_vl import qwen3_vl_gpu_patch_gen_config as cfg
+    from veomni.models.transformers.qwen3_vl import modeling_qwen3_vl as cfg
 
     captured = {}
 
@@ -180,3 +155,24 @@ def test_qwen3_vl_async_helper_forwards_skip_ulysses(monkeypatch):
     assert captured["skip_ulysses"] is True
     assert captured["query_seq"] == 8
     assert captured["rms_norm"] is rms_handle
+
+
+def test_qwen3_vl_npu_generated_attention_binds_ops_and_runs_eager_forward():
+    from veomni.models.transformers.qwen3_vl.modeling_qwen3_vl import (
+        Qwen3VLForConditionalGeneration,
+    )
+
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config._set_ops_implementation(eager_ops_config())
+    model = Qwen3VLForConditionalGeneration(config).eval()
+    attn = model.model.language_model.layers[0].self_attn
+    assert attn.veomni_rope.impl == "eager"
+    assert attn.veomni_attn.impl == "eager"
+    assert attn.q_norm.veomni_rms_norm.impl == "eager"
+    assert attn.k_norm.veomni_rms_norm.impl == "eager"
+
+    input_ids = torch.randint(3, 100, (1, 6))
+    with torch.no_grad():
+        out = model(input_ids=input_ids, use_cache=False)
+    assert torch.isfinite(out.logits).all()

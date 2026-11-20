@@ -32,7 +32,6 @@ from veomni.models.transformers.deepseek_v4.indexer_loss import (
     _indexer_loss_enabled,
     indexer_kl_terms,
 )
-from veomni.ops.config import get_ops_config, set_ops_config
 from veomni.utils.model_outputs import MoeModelOutputWithIndexerKL
 
 
@@ -41,15 +40,10 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 @contextmanager
 def _kernels_config_installed(**overrides):
-    previous = get_ops_config()
     installed = eager_ops_config()
     for key, value in overrides.items():
         setattr(installed, key, value)
-    set_ops_config(installed)
-    try:
-        yield installed
-    finally:
-        set_ops_config(previous)
+    yield installed
 
 
 def _module_with_config(*, indexer: str = "eager", attention: str = "eager", **overrides):
@@ -287,9 +281,10 @@ def test_indexer_loss_reads_the_bound_handles_not_the_global_config(
                 _indexer_loss_enabled(module)
 
 
-def test_the_npu_backend_refuses_the_objective_rather_than_dropping_it():
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as npu
+def test_the_npu_backend_refuses_the_objective_rather_than_dropping_it(monkeypatch: pytest.MonkeyPatch):
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as npu
 
+    monkeypatch.setattr(npu, "IS_NPU_AVAILABLE", True)
     with pytest.raises(NotImplementedError, match="dsa_indexer_loss is not implemented on NPU"):
         npu.DeepseekV4CSACompressor.forward(
             None,
@@ -303,7 +298,7 @@ def test_the_npu_backend_refuses_the_objective_rather_than_dropping_it():
 
 
 def test_causallm_folds_indexer_kl_into_loss_and_aux_metrics(monkeypatch: pytest.MonkeyPatch):
-    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+    from veomni.models.transformers.deepseek_v4.modeling_deepseek_v4 import (
         DeepseekV4ForCausalLM,
     )
 
@@ -329,12 +324,8 @@ def test_causallm_folds_indexer_kl_into_loss_and_aux_metrics(monkeypatch: pytest
         attn_implementation="eager",
         experts_implementation="eager",
     )
-    previous = get_ops_config()
-    set_ops_config(eager_ops_config())
-    try:
-        model = DeepseekV4ForCausalLM(config)
-    finally:
-        set_ops_config(previous)
+    config._set_ops_implementation(eager_ops_config())
+    model = DeepseekV4ForCausalLM(config)
 
     hidden = torch.randn(1, 4, config.hidden_size)
     kl_total = torch.tensor(8.0)
@@ -353,7 +344,7 @@ def test_causallm_folds_indexer_kl_into_loss_and_aux_metrics(monkeypatch: pytest
         lambda **kwargs: (torch.tensor(2.0), None, None),
     )
     monkeypatch.setattr(
-        "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu.get_parallel_state",
+        "veomni.models.transformers.deepseek_v4.modeling_deepseek_v4.get_parallel_state",
         lambda: SimpleNamespace(sp_enabled=False),
     )
 
@@ -366,7 +357,7 @@ def test_causallm_folds_indexer_kl_into_loss_and_aux_metrics(monkeypatch: pytest
 
 
 def test_the_flag_is_refused_when_no_layer_can_build_a_kl(monkeypatch: pytest.MonkeyPatch):
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as gpu
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as gpu
 
     config = DeepseekV4Config(
         vocab_size=32,
@@ -389,12 +380,8 @@ def test_the_flag_is_refused_when_no_layer_can_build_a_kl(monkeypatch: pytest.Mo
         attn_implementation="eager",
         experts_implementation="eager",
     )
-    previous = get_ops_config()
-    set_ops_config(eager_ops_config())
-    try:
-        model = gpu.DeepseekV4ForCausalLM(config)
-    finally:
-        set_ops_config(previous)
+    config._set_ops_implementation(eager_ops_config())
+    model = gpu.DeepseekV4ForCausalLM(config)
 
     monkeypatch.setattr(
         "veomni.models.transformers.deepseek_v4.indexer_loss._indexer_loss_enabled",
@@ -455,15 +442,11 @@ def _install_term_attention(attention, index_score: torch.Tensor, target: torch.
 
 
 def _build_indexed_model(monkeypatch: pytest.MonkeyPatch):
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as gpu
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as gpu
 
     config = _tiny_mixed_layer_config()
-    previous = get_ops_config()
-    set_ops_config(eager_ops_config())
-    try:
-        model = gpu.DeepseekV4ForCausalLM(config)
-    finally:
-        set_ops_config(previous)
+    config._set_ops_implementation(eager_ops_config())
+    model = gpu.DeepseekV4ForCausalLM(config)
     _enable_indexer_kl(monkeypatch, gpu)
     return gpu, model
 
@@ -532,17 +515,13 @@ def test_indexer_kl_survives_decoder_layer_checkpoint(monkeypatch: pytest.Monkey
 
 
 def test_two_csa_layers_sum_the_objective_and_mean_the_metric(monkeypatch: pytest.MonkeyPatch):
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as gpu
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as gpu
 
     config = _tiny_mixed_layer_config()
     config.num_hidden_layers = 2
     config.layer_types = ["compressed_sparse_attention", "compressed_sparse_attention"]
-    previous = get_ops_config()
-    set_ops_config(eager_ops_config())
-    try:
-        model = gpu.DeepseekV4ForCausalLM(config)
-    finally:
-        set_ops_config(previous)
+    config._set_ops_implementation(eager_ops_config())
+    model = gpu.DeepseekV4ForCausalLM(config)
     _enable_indexer_kl(monkeypatch, gpu)
     score_a = torch.tensor([[[1.0, 0.0, float("-inf")]]], requires_grad=True)
     score_b = torch.tensor([[[0.0, 1.0, float("-inf")]]], requires_grad=True)

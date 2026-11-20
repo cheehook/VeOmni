@@ -27,9 +27,9 @@ Users can directly load models from HuggingFace and start the training process b
 
 ### 1. Create Your Model Implementation
 
-Create a model package under `veomni/models/transformers/`. Declare
-model changes in a patchgen config and generate the modeling file; do not edit
-the generated output directly.
+Create a model package under `veomni/models/transformers/` with a standalone
+`modeling_<model>.py` and
+instance-local `VeomniOp` handles.
 
 
 ### 2. Register Your Model
@@ -39,18 +39,26 @@ See the [new-model guide](../usage/support_new_models/guide_and_checklist.md) fo
 
 ### 3. Model Configuration
 
-Your model should have a corresponding configuration class that inherits from `PretrainedConfig`. The configuration should include:
+Your model should have a corresponding configuration class that inherits from `VeOmniPretrainedConfig`. The configuration should include:
 
 ```python
-class YourCustomConfig(PretrainedConfig):
+from veomni.models import VeOmniPretrainedConfig
+
+class YourCustomConfig(VeOmniPretrainedConfig):
     model_type = "your_custom_model"
     architectures = ["YourCustomModel"]  # This should match your model class name
 ```
 
-You can also use the model configuration from HuggingFace if you are only modifying the modeling component of an existing HuggingFace model.
+To extend an HF schema, inherit `(VeOmniPretrainedConfig, HFConfig)`; declared
+`sub_configs` are adapted recursively. To construct an adapted HF config without
+defining an extension, use `get_veomni_config_class(HFConfig)`. VeOmni's
+loaders and generated model base adapt native HF inputs automatically; native HF
+classes themselves remain unchanged. Custom config constructors forward
+`ops_implementation` to `super().__init__`. See the
+[module configuration contract](../design/module_config.md).
 
 
-Register the generated model class from the package's `__init__.py`:
+Register the model class from the package's `__init__.py`:
 
 ```python
 # veomni/models/transformers/your_custom_model/__init__.py
@@ -66,7 +74,7 @@ def register_config():
 
 @MODELING_REGISTRY.register("your_custom_model")
 def register_modeling(architecture: str):
-    from .generated.patched_modeling_your_custom_model_gpu import YourCustomModel
+    from .modeling_your_custom_model import YourCustomModel
 
     return YourCustomModel
 ```
@@ -74,7 +82,7 @@ def register_modeling(architecture: str):
 Import the package from `veomni/models/transformers/__init__.py` so the
 decorators run at package import time. See the
 [new-model guide](../usage/support_new_models/guide_and_checklist.md) for the
-patchgen config and validation workflow.
+`modeling_<model>.py` authoring and validation workflow.
 
 ### 4. Loading Your Model
 

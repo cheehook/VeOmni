@@ -365,16 +365,20 @@ def test_vlm_vision_forward_contract(family, backend, attention):
     assert f"VLM_FORWARD_CASES_OK={expected}" in result.stdout
 
 
-def _vision_real_image_sp_non_fa_worker(attention, parallel_mode):
-    from transformers import Qwen4ExpConfig
+def _qwen4_exp_config(attention="eager"):
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.models import build_config
 
-    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
-    from veomni.ops.config import set_ops_config
-
-    backend = "npu" if get_device_type() == "npu" else "gpu"
-    module = importlib.import_module(
-        f"veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_{backend}"
+    return build_config(
+        "tests/toy_config/qwen4_exp_toy/config.json",
+        ops_implementation=make_eager_ops_config(attn_implementation=attention),
     )
+
+
+def _vision_real_image_sp_non_fa_worker(attention, parallel_mode):
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
+
+    module = importlib.import_module("veomni.models.transformers.qwen4_exp.modeling_qwen4_exp")
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     try:
@@ -385,16 +389,7 @@ def _vision_real_image_sp_non_fa_worker(attention, parallel_mode):
             device_type=get_device_type(),
             name=parallel_mode,
         )
-        config = Qwen4ExpConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json").vision_config
-        config._attn_implementation = attention
-        set_ops_config(
-            SimpleNamespace(
-                rms_norm_gated_implementation="fla",
-                causal_conv1d_implementation="fla",
-                chunk_gated_delta_rule_implementation="fla",
-                qsa_attention_implementation="eager",
-            )
-        )
+        config = _qwen4_exp_config(attention).vision_config
         device = torch.device(get_device_type(), rank)
         vision = module.Qwen4ExpVisionModel(config).to(device=device, dtype=torch.bfloat16)
         for tensor in (*vision.parameters(), *vision.buffers()):
@@ -432,19 +427,14 @@ def test_qwen4_exp_vision_real_image_sp_rejects_non_flash_attention(attention, p
 @pytest.mark.launch_plan(provider=_single_accelerator_vision_plan)
 @pytest.mark.skipif(not _vision_runner_has_accelerators(1), reason="requires a supported accelerator")
 def test_qwen4_exp_vision_flash_adapter_binding():
-    from transformers import Qwen4ExpConfig
-
     backend = "npu" if get_device_type() == "npu" else "gpu"
     if backend == "gpu":
         from veomni.ops.registry import OP_REGISTRY
 
         if "veomni_flash_attention_2" not in OP_REGISTRY.list_available("attention", "standard"):
             pytest.skip("FlashAttention 2 is unavailable on this GPU")
-    module = importlib.import_module(
-        f"veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_{backend}"
-    )
-    config = Qwen4ExpConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json").vision_config
-    config._attn_implementation = "veomni_flash_attention_2"
+    module = importlib.import_module("veomni.models.transformers.qwen4_exp.modeling_qwen4_exp")
+    config = _qwen4_exp_config("veomni_flash_attention_2").vision_config
     vision = module.Qwen4ExpVisionModel(config)
     assert len(vision.blocks) > 0
     assert all(block.attn.veomni_attn.impl == "veomni_flash_attention_2" for block in vision.blocks)
@@ -475,9 +465,9 @@ def _install_vision_state(monkeypatch, module, sp_size, sp_rank):
 
 def _check_dummy_vision_inputs(family, backend):
     model_package = "qwen2_5vl" if family == "qwen2_5_vl" else family
-    module = importlib.import_module(
-        f"veomni.models.transformers.{model_package}.generated.patched_modeling_{family}_{backend}"
-    )
+    module = importlib.import_module(f"veomni.models.transformers.{model_package}.modeling_{family}")
+    if hasattr(module, "IS_NPU_AVAILABLE"):
+        module.IS_NPU_AVAILABLE = backend == "npu"
     vision_names = {
         "qwen2_5_vl": "Qwen2_5_VisionTransformerPretrainedModel",
         "qwen3_vl": "Qwen3VLVisionModel",
@@ -530,7 +520,6 @@ def _check_dummy_vision_inputs(family, backend):
 
     from tests.models.tiny_configs import tiny_qwen2_5_vl_config, tiny_qwen3_vl_config
     from tests.tools.training_utils import make_eager_ops_config
-    from veomni.ops.config import set_ops_config
 
     if family == "qwen2_5_vl":
         config = tiny_qwen2_5_vl_config().vision_config
@@ -539,11 +528,8 @@ def _check_dummy_vision_inputs(family, backend):
     elif family == "qwen3_vl":
         config = tiny_qwen3_vl_config().vision_config
     else:
-        from transformers import Qwen4ExpConfig
-
-        config = Qwen4ExpConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json").vision_config
-    config._attn_implementation = "eager"
-    set_ops_config(make_eager_ops_config(rotary_pos_emb_vision_implementation="eager"))
+        config = _qwen4_exp_config().vision_config
+    config._set_ops_implementation(make_eager_ops_config())
     with pytest.MonkeyPatch.context() as monkeypatch:
         _install_vision_state(monkeypatch, module, 1, 0)
         vision = vision_cls(config).train()
@@ -556,13 +542,12 @@ def _check_dummy_vision_inputs(family, backend):
 
 
 def _check_vlm_vision_forward(family, backend, attention):
-    from transformers import Qwen4ExpConfig
-
     from tests.models.tiny_configs import tiny_qwen3_vl_config
+    from tests.tools.training_utils import make_eager_ops_config
 
-    module = importlib.import_module(
-        f"veomni.models.transformers.{family}.generated.patched_modeling_{family}_{backend}"
-    )
+    module = importlib.import_module(f"veomni.models.transformers.{family}.modeling_{family}")
+    if hasattr(module, "IS_NPU_AVAILABLE"):
+        module.IS_NPU_AVAILABLE = backend == "npu"
     # Qwen3-VL's non-FA SP path is not the Qwen4 rejection contract. Cover its
     # regular single-rank path and its FA metadata path without inventing one.
     sp_sizes = (1,) if family == "qwen3_vl" and attention != "veomni_flash_attention_2" else (1, 2, 8, 16, 32)
@@ -573,11 +558,15 @@ def _check_vlm_vision_forward(family, backend, attention):
                 config = tiny_qwen3_vl_config().vision_config
                 vision_cls = module.Qwen3VLVisionModel
             else:
-                config = Qwen4ExpConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json").vision_config
+                config = _qwen4_exp_config().vision_config
                 vision_cls = module.Qwen4ExpVisionModel
             # Construct without a hardware FlashAttention dependency; the
             # recorder below still exercises the real vision forward path.
-            config._attn_implementation = "eager" if attention == "veomni_flash_attention_2" else attention
+            config._set_ops_implementation(
+                make_eager_ops_config(
+                    attn_implementation="eager" if attention == "veomni_flash_attention_2" else attention
+                )
+            )
             torch.manual_seed(42)
             model = vision_cls(config).eval()
             merge = config.spatial_merge_size
@@ -598,9 +587,7 @@ def _check_vlm_vision_forward(family, backend, attention):
                     return query, None
 
                 for active_config in (config, *(block.attn.config for block in model.blocks)):
-                    active_config._attn_implementation = attention
-                    if hasattr(active_config, "_attn_implementation_internal"):
-                        active_config._attn_implementation_internal = attention
+                    active_config._set_ops_implementation({"attn_implementation": attention})
                 for block in model.blocks:
                     block.attn.veomni_rope = lambda query, key, _cos, _sin: (query, key)
                     block.attn.veomni_attn = record_attention
@@ -633,16 +620,10 @@ if __name__ == "__main__":
     elif mode == "forward":
         _check_vlm_vision_forward(*arguments)
     elif mode == "qwen4_weights":
-        from transformers import Qwen4ExpConfig
-
-        from tests.tools.training_utils import make_eager_ops_config
-        from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu import (
+        from veomni.models.transformers.qwen4_exp.modeling_qwen4_exp import (
             Qwen4ExpForConditionalGeneration,
         )
-        from veomni.ops.config import set_ops_config
 
-        set_ops_config(make_eager_ops_config(rotary_pos_emb_vision_implementation="eager"))
-        config = Qwen4ExpConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json")
-        Qwen4ExpForConditionalGeneration(config).save_pretrained(arguments[0])
+        Qwen4ExpForConditionalGeneration(_qwen4_exp_config()).save_pretrained(arguments[0])
     else:
         raise ValueError(f"Unknown vision contract mode: {mode}")

@@ -63,7 +63,7 @@ import torch.nn as nn
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config
-from veomni.ops.config import get_ops_config, set_ops_config
+from veomni.models.configuration_base import as_veomni_config
 from veomni.utils.moe_router_replay import set_active_replay
 
 
@@ -78,15 +78,12 @@ _DEVICE = torch.device("cpu")
 
 @pytest.fixture(autouse=True)
 def _restore_active_replay():
-    """Select eager ops for construction and restore process state even after failures."""
-    previous_ops = get_ops_config()
-    set_ops_config(eager_ops_config())
+    """Restore active replay state even after failures."""
     set_active_replay(None)
     try:
         yield
     finally:
         set_active_replay(None)
-        set_ops_config(previous_ops)
 
 
 # ----------------------------------------------------------------- mocks
@@ -140,7 +137,7 @@ def _make_qwen3_moe_config():
     """Toy ``Qwen3MoeConfig`` sized for fast invariant testing."""
     from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-    return Qwen3MoeConfig(
+    config = Qwen3MoeConfig(
         vocab_size=128,
         hidden_size=64,
         intermediate_size=128,
@@ -159,13 +156,15 @@ def _make_qwen3_moe_config():
         router_aux_loss_coef=0.0,
         rms_norm_eps=1e-6,
     )
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
+    return config
 
 
 def _make_qwen3_5_moe_config():
     """Toy ``Qwen3_5MoeConfig`` sized for fast invariant testing."""
     from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 
-    return Qwen3_5MoeConfig(
+    config = Qwen3_5MoeConfig(
         vocab_size=128,
         hidden_size=64,
         intermediate_size=128,
@@ -185,6 +184,8 @@ def _make_qwen3_5_moe_config():
         router_aux_loss_coef=0.0,
         rms_norm_eps=1e-6,
     )
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
+    return config
 
 
 def _make_qwen4_exp_config(norm_topk_prob: bool):
@@ -193,6 +194,7 @@ def _make_qwen4_exp_config(norm_topk_prob: bool):
 
     config = Qwen4ExpConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json").text_config
     config.norm_topk_prob = norm_topk_prob
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
     return config
 
 
@@ -218,7 +220,7 @@ def _init_block_deterministic(block: nn.Module, seed: int = 0) -> None:
 
 
 def _build_patched_qwen3_moe_block(config, device=_DEVICE, dtype=torch.float32):
-    from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import (
+    from veomni.models.transformers.qwen3_moe.modeling_qwen3_moe import (
         Qwen3MoeSparseMoeBlock as PatchedQwen3MoeSparseMoeBlock,
     )
 
@@ -244,7 +246,7 @@ def _build_vanilla_qwen3_moe_block(config, device=_DEVICE, dtype=torch.float32):
 
 
 def _build_patched_qwen3_5_moe_block(config, device=_DEVICE, dtype=torch.float32):
-    from veomni.models.transformers.qwen3_5_moe.generated.patched_modeling_qwen3_5_moe_gpu import (
+    from veomni.models.transformers.qwen3_5_moe.modeling_qwen3_5_moe import (
         Qwen3_5MoeSparseMoeBlock as PatchedQwen3_5MoeSparseMoeBlock,
     )
 
@@ -271,15 +273,10 @@ def _moe_block_hidden(output):
 
 
 def _build_patched_qwen4_exp_block(config, backend="gpu", device=_DEVICE, dtype=torch.float32):
-    """Build either generated Qwen4-Exp block with an instance-local eager expert op."""
-    if backend == "npu":
-        from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_npu import (
-            Qwen4ExpTextSparseMoeBlock as PatchedQwen4ExpTextSparseMoeBlock,
-        )
-    else:
-        from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu import (
-            Qwen4ExpTextSparseMoeBlock as PatchedQwen4ExpTextSparseMoeBlock,
-        )
+    """Build the Qwen4-Exp block with an instance-local eager expert op."""
+    from veomni.models.transformers.qwen4_exp.modeling_qwen4_exp import (
+        Qwen4ExpTextSparseMoeBlock as PatchedQwen4ExpTextSparseMoeBlock,
+    )
 
     block = PatchedQwen4ExpTextSparseMoeBlock(config).to(device=device, dtype=dtype)
     assert block.experts.veomni_moe.impl == "eager"
