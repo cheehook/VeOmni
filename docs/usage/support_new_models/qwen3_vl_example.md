@@ -4,15 +4,14 @@
 
 This document walks through the specific patches applied to integrate **Qwen3-VL MoE** into VeOmni. It is a concrete example of the patterns described in [guide_and_checklist.md](./guide_and_checklist.md), covering FSDP, Sequence Parallelism, Expert Parallelism, and model registration.
 
-> **Scope note:** VeOmni now ships patchgen-generated modeling files under
-> `veomni/models/transformers/<model>/generated/`, so the actual code lives in
-> [veomni/models/transformers/qwen3_vl_moe/qwen3_vl_moe_gpu_patch_gen_config.py](../../../veomni/models/transformers/qwen3_vl_moe/qwen3_vl_moe_gpu_patch_gen_config.py)
+> **Scope note:** VeOmni ships standalone modeling files under
+> `veomni/models/transformers/<model>/modeling_<model>.py`, so the actual code lives in
+> [veomni/models/transformers/qwen3_vl_moe/modeling_qwen3_vl_moe.py](../../../veomni/models/transformers/qwen3_vl_moe/modeling_qwen3_vl_moe.py)
 > rather than the runtime `apply_veomni_*_patch()` helpers shown below. The
 > patterns (FSDP dummy forward, SP slicing, MoE `VeomniOp`, EP plan) are unchanged;
-> what has changed is *where* the patches are declared (in the patchgen config
-> and emitted into `generated/`) rather than applied at import time. See
-> [the patchgen design guide](../../design/patchgen.md) and
-> the `veomni-patchgen-model` agent skill for the current flow.
+> what has changed is *where* the adaptations live (directly in `modeling_qwen3_vl_moe.py`)
+> rather than applied at import time. See the `/veomni-new-model` agent skill
+> for the current workflow.
 
 ---
 
@@ -223,7 +222,6 @@ def get_parallel_plan():
 Qwen3-VL MoE already stores a fused `gate_up_proj` of shape `[E, 2*I, H]`. Replace the experts class so it always calls a local `moe_experts` handle. Pass the merged tensor as `fc1_1_2_weight` and leave the split `fc1_*` slots empty. `eager` is a registered row, not a `super().forward` fallback.
 
 ```python
-from veomni.ops.config import resolve_op_impl
 from veomni.ops import VeomniOp
 
 
@@ -239,7 +237,7 @@ class Qwen3VLMoeTextExperts(nn.Module):
         self.down_proj = nn.Parameter(
             torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
         )
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
+        self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
         unused = self.gate_up_proj.new_empty(0)
@@ -255,7 +253,7 @@ class Qwen3VLMoeTextExperts(nn.Module):
         )
 ```
 
-Use `@config.replace_class("Qwen3VLMoeTextExperts")` so the upstream `@use_experts_implementation` decorator is dropped. The SparseMoeBlock keeps passing compact top-k index/weight tensors into `Experts.forward`; do not reconstruct a full scatter tensor, split/transpose `gate_up_proj`, or call a public `fused_moe_forward`.
+Define the `Qwen3VLMoeTextExperts` class directly in the standalone modeling file and remove the upstream `@use_experts_implementation` decorator. The SparseMoeBlock keeps passing compact top-k index/weight tensors into `Experts.forward`; do not reconstruct a full scatter tensor, split/transpose `gate_up_proj`, or call a public `fused_moe_forward`.
 
 ---
 

@@ -30,7 +30,6 @@ from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
     named_trainable,
-    ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_gpt_oss_config as _tiny_config
 from veomni.utils.device import get_device_type
@@ -38,12 +37,12 @@ from veomni.utils.import_utils import is_quack_gemm_available
 
 
 def _build_ours(config: GptOssConfig, ops: SimpleNamespace | None = None):
-    from veomni.models.transformers.gpt_oss.generated.patched_modeling_gpt_oss_gpu import (
+    from veomni.models.transformers.gpt_oss.modeling_gpt_oss import (
         GptOssForCausalLM,
     )
 
-    with ops_config_scope(ops if ops is not None else eager_ops_config()):
-        return GptOssForCausalLM(config)
+    config._set_ops_implementation(ops if ops is not None else eager_ops_config())
+    return GptOssForCausalLM(config)
 
 
 @pytest.mark.parametrize(

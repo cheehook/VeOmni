@@ -4,15 +4,15 @@ VeOmni registers sequence-parallel FlashAttention, AITER, FlexAttention, SDPA,
 SageAttention, and MagiAttention FFA adapters in Transformers'
 `ALL_ATTENTION_FUNCTIONS`. There is no `fused_attention_forward` facade and
 no replaceable module-level `_flash_attention_forward` slots. Patched models
-bind `VeomniOp("attention", "standard", config._attn_implementation)` once in `__init__` / `modify_init` and call
+bind `VeomniOp("attention", "standard", config.ops_config.attn_implementation)` once in `__init__` / `modify_init` and call
 `self.veomni_attn` from `forward`.
 
 Public names such as `flash_attention_2` rewrite to `veomni_flash_attention_2`
 (not a `_with_sp` suffix). Ulysses wrapping lives inside those registered
 adapters.
 
-Models continue to select an attention implementation through
-`config._attn_implementation`; modeling code stores that choice in a local
+Models select an attention implementation through
+`config.ops_config.attn_implementation` (kept in sync with `config._attn_implementation` for HF mask builders); modeling code stores that choice in a local
 `VeomniOp("attention", "standard", implementation)` handle.
 
 ## Configuration
@@ -31,7 +31,7 @@ The model must call the attention implementation selected by
 `config._attn_implementation` and must supply a native `BlockMask` whose
 predicate preserves all model-specific visibility rules. A model that
 hard-codes SDPA/FlashAttention, constructs only dense masks, or bypasses
-Transformers' mask registry needs model-level patchgen adaptation first.
+Transformers' mask registry needs an adaptation in its standalone modeling file.
 
 With `MODELING_BACKEND=veomni`, `OpsImplementationConfig` rewrites this public
 value to `veomni_flex_attention`. Flash values are rewritten in the
@@ -69,9 +69,11 @@ model-local VeomniOp("attention", "standard", implementation)
 `apply_veomni_attention_patch()` registers the concrete `veomni_*` forward
 functions and matching mask builders in the Transformers registries. Each ops
 row then uses the same Transformers interface lookup as the model-facing path.
-The `eager` row falls back to the modeling module's local
-`eager_attention_forward`, because Transformers does not register eager
-attention globally. The short `flex_attention` and `magi_attention` rows resolve
+The `eager` row uses the modeling module's local `eager_attention_forward` when
+present, preserving model-specific math. Modules without that function forward
+through `veomni_sdpa`, including its packed-sequence and Ulysses handling.
+Transformers' global eager interface is unchanged. The short `flex_attention`
+and `magi_attention` rows resolve
 their `veomni_*` interfaces so they share the adapters' device and backend
 behavior when selected directly through the ops registry.
 
@@ -387,15 +389,16 @@ host sync. A future Magi Context Parallel implementation may reuse
 this mask carrier, but distributed dispatch/calc/undispatch and `cp_size > 1`
 are outside the current contract.
 
-## Integrating a new patchgen model
+## Integrating a new HF-derived model
 
 Before enabling `attn_implementation: flex_attention` for a new model:
 
 1. Inspect the pinned Transformers modeling source. Its attention layer must
    dispatch through `ALL_ATTENTION_FUNCTIONS` using
    `config._attn_implementation`, and its mask preparation must select the
-   matching builder from `ALL_MASK_ATTENTION_FUNCTIONS`. Add narrow patchgen
-   overrides when either path is hard-coded.
+   matching builder from `ALL_MASK_ATTENTION_FUNCTIONS`. Adapt narrow overrides
+   in `veomni/models/transformers/<model>/modeling_<model>.py` when either path
+   is hard-coded.
 2. Preserve the model's complete visibility contract in a native `BlockMask`.
    Full attention, sliding windows, bidirectional regions, packed-sample
    boundaries, prefix rules, and cache offsets remain model-owned semantics;
@@ -403,34 +406,30 @@ Before enabling `attn_implementation: flex_attention` for a new model:
    fixed `mask_mod` that gathers per-token metadata over a new Python-constant
    closure on every batch.
 3. If VeOmni packing or Ulysses changes the mask inputs, replace the relevant
-   Transformers mask-helper imports in the patchgen config and pass the
-   required metadata through the generated model forward. Packed boundaries
+   Transformers mask-helper imports in `modeling_<model>.py` and pass the
+   required metadata through the model forward. Packed boundaries
    must be prepared before model forward from full, unsliced sequence metadata;
    do not recompute them inside attention layers after SP slicing. Self-
    attention may use one boundary vector for both query and key visibility,
    while asymmetric attention must forward every Q/K boundary input its mask
-   helper requires. Do not edit the generated modeling file directly.
-4. Register the generated class in `MODELING_REGISTRY` under the exact config
+   helper requires.
+4. Register the model class in `MODELING_REGISTRY` under the exact config
    `model_type`. If the integration adds a custom config or processor, register
    those in `MODEL_CONFIG_REGISTRY` and `MODEL_PROCESSOR_REGISTRY` as well.
    Import the model package from `veomni.models.transformers` so every
    module-level registration runs at import time.
-5. Regenerate with `patchgen ... --diff -v`, review the generated output, run
-   `patchgen --check`, and add model-level tests for registry routing, native
-   BlockMask type/visibility, forward/backward parity, packing, and Ulysses
-   where supported.
+5. Add model-level tests for registry routing, native BlockMask
+   type/visibility, forward/backward parity, packing, and Ulysses where
+   supported.
 
-Gemma 3 is the concrete reference in this repository. Its patchgen config
-replaces the upstream causal/sliding mask-helper imports with VeOmni wrappers
-and overrides `Gemma3TextModel.forward` so `cu_seq_lens_q` reaches mask
-construction. Gemma 3 uses self-attention, so that one packed-boundary vector
-defines both query and key sample membership. The resulting full/sliding
-`BlockMask` objects still come from the model's native visibility rules; only
-after that adaptation does the `flex_attention` ops setting select the VeOmni
-backend.
-
-See [Modeling Code Generation](../design/patchgen.md#adding-a-new-model) for
-the complete patchgen generation and drift-check workflow.
+Gemma 3 (`veomni/models/transformers/gemma3/modeling_gemma3.py`) is the concrete
+reference in this repository. It replaces the upstream causal/sliding
+mask-helper imports with VeOmni wrappers and adapts `Gemma3TextModel.forward` so
+`cu_seq_lens_q` reaches mask construction. Gemma 3 uses self-attention, so that
+one packed-boundary vector defines both query and key sample membership. The
+resulting full/sliding `BlockMask` objects still come from the model's native
+visibility rules; only after that adaptation does the `flex_attention` ops
+setting select the VeOmni backend.
 
 ## Ulysses sequence parallelism
 

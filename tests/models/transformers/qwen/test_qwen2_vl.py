@@ -36,7 +36,6 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
-    ops_config_scope,
     qwen_image_inputs,
 )
 from tests.models.tiny_configs import tiny_qwen2_vl_config as _tiny_config
@@ -57,7 +56,7 @@ def _qwen2_vl_vision_fsdp_checkpoint_worker():
     from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
     from veomni.distributed.parallel_state import _init_parallel_state
-    from veomni.models.transformers.qwen2_vl.generated.patched_modeling_qwen2_vl_gpu import (
+    from veomni.models.transformers.qwen2_vl.modeling_qwen2_vl import (
         Qwen2VisionTransformerPretrainedModel,
     )
 
@@ -65,11 +64,10 @@ def _qwen2_vl_vision_fsdp_checkpoint_worker():
     _init_parallel_state(dp_size=world_size, dp_shard_size=world_size)
     torch.manual_seed(43)
     config = _tiny_config().vision_config
-    config._attn_implementation = "eager"
     ops = eager_ops_config()
     ops.rotary_pos_emb_vision_implementation = None
-    with ops_config_scope(ops):
-        reference = Qwen2VisionTransformerPretrainedModel(config).to(get_device_type()).train()
+    config._set_ops_implementation(ops)
+    reference = Qwen2VisionTransformerPretrainedModel(config).to(get_device_type()).train()
     checkpointed = copy.deepcopy(reference)
     checkpointed.gradient_checkpointing_enable({"use_reentrant": False})
     assert all(block.attn.veomni_rope.impl == "liger_kernel" for block in checkpointed.blocks)
@@ -115,12 +113,12 @@ def test_qwen2_vl_default_vision_rope_with_fsdp_checkpoint():
 
 
 def _build_ours(config: Qwen2VLConfig, ops: SimpleNamespace | None = None):
-    from veomni.models.transformers.qwen2_vl.generated.patched_modeling_qwen2_vl_gpu import (
+    from veomni.models.transformers.qwen2_vl.modeling_qwen2_vl import (
         Qwen2VLForConditionalGeneration,
     )
 
-    with ops_config_scope(ops if ops is not None else eager_ops_config()):
-        return Qwen2VLForConditionalGeneration(config)
+    config._set_ops_implementation(ops if ops is not None else eager_ops_config())
+    return Qwen2VLForConditionalGeneration(config)
 
 
 def test_qwen2_vl_eager_matches_hf_text_only():

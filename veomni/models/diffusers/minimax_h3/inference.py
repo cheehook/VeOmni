@@ -28,7 +28,6 @@ from PIL import Image
 from tqdm import tqdm
 
 from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights
-from veomni.ops.config import set_ops_config
 from veomni.utils.device import get_device_type
 
 from .minimax_h3_condition.configuration_minimax_h3_condition import MiniMaxH3ConditionModelConfig
@@ -377,9 +376,6 @@ class MiniMaxH3Pipeline(BasePipeline):
           tokenizer/processor) via MiniMaxH3ConditionModel.
         - DiT via MiniMaxH3DiTModel on meta, then load_model_weights on CPU.
         """
-        if ops_implementation is not None:
-            set_ops_config(ops_implementation)
-
         pipe = MiniMaxH3Pipeline(device=device, torch_dtype=torch_dtype)
 
         # Condition model: encoders are always needed at inference time, so
@@ -389,7 +385,10 @@ class MiniMaxH3Pipeline(BasePipeline):
         # Video VAE weights live in video_vae/source (checkpoint layout); the
         # config default subfolder "video_vae" has no safetensors directly.
         condition_model_cfg.setdefault("video_vae_subfolder", "video_vae/source")
-        condition_cfg = MiniMaxH3ConditionModelConfig.from_pretrained(condition_model_path, **condition_model_cfg)
+        condition_cfg = MiniMaxH3ConditionModelConfig.from_pretrained(
+            condition_model_path, _validate_ops=False, **condition_model_cfg
+        )
+        condition_cfg._apply_ops_overrides(ops_implementation=ops_implementation)
         condition_model = MiniMaxH3ConditionModel._from_config(condition_cfg)
         condition_model.eval()
 
@@ -423,8 +422,9 @@ class MiniMaxH3Pipeline(BasePipeline):
         # Meta init skips weight load; the explicit call below materializes
         # the weights on CPU instead.
         dit_config = MiniMaxH3DiTModelConfig.from_pretrained(
-            transformer_config_path, **(transformer_config_kwargs or {})
+            transformer_config_path, _validate_ops=False, **(transformer_config_kwargs or {})
         )
+        dit_config._apply_ops_overrides(ops_implementation=ops_implementation)
         with init_empty_weights():
             pipe.dit = MiniMaxH3DiTModel._from_config(dit_config, torch_dtype=torch.bfloat16)
         load_model_weights(pipe.dit, transformer_weights_path, init_device="cpu")
@@ -1187,15 +1187,15 @@ def model_fn_minimax_h3(
     cond_anchor = ref_visual_anchor if ref_visual_anchor is not None else keyframe_cond_anchor
     cond_rows_count = 0 if cond_anchor is None else cond_anchor.shape[0]
     x = torch.zeros(1, seq_len, 96, dtype=dtype, device=device)
-    x[0, img_pos[cond_rows_count:]] = video_rows
+    x[0, img_pos[cond_rows_count:]] = video_rows.to(x)
     if cond_anchor is not None:
-        x[0, img_pos[:cond_rows_count]] = cond_anchor
+        x[0, img_pos[:cond_rows_count]] = cond_anchor.to(x)
     # Audio Sequence
     ref_audio_rows_count = 0 if ref_audio_anchor is None else ref_audio_anchor.shape[0]
     audio_x = torch.zeros(1, seq_len, 32, dtype=dtype, device=device)
-    audio_x[0, audio_pos[ref_audio_rows_count:]] = audio_rows
+    audio_x[0, audio_pos[ref_audio_rows_count:]] = audio_rows.to(audio_x)
     if ref_audio_anchor is not None:
-        audio_x[0, audio_pos[:ref_audio_rows_count]] = ref_audio_anchor
+        audio_x[0, audio_pos[:ref_audio_rows_count]] = ref_audio_anchor.to(audio_x)
 
     timesteps = torch.full((seq_len,), float(t_video), dtype=torch.float32, device=device)
     timesteps[audio_pos] = float(t_audio)
